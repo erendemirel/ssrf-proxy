@@ -4,158 +4,59 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
 
-type TestServer struct {
-	server  *http.Server
-	port    string
-	baseURL string
-	ctx     context.Context
-	cancel  context.CancelFunc
-	started chan bool
-	mu      sync.Mutex
-}
+func startTestProxy(t *testing.T, allowInternal, allowDNSRebinding bool) (string, func()) {
+	t.Helper()
 
-func NewTestServer(allowInternal, allowDNSRebinding bool) (*TestServer, error) {
 	proxy := NewSSRFProxy()
 	proxy.blockInternalIPs = !allowInternal
 	proxy.blockDNSRebinding = !allowDNSRebinding
-	proxy.verbose = false // Keep logs quiet during tests
+	proxy.verbose = false
+	proxy.timeoutDuration = 5 * time.Second
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", proxy.healthHandler)
-	mux.HandleFunc("/", proxy.proxyHandler)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
 
 	server := &http.Server{
-		Addr:         ":0", // Use any available port
-		Handler:      mux,
+		Handler:      http.HandlerFunc(proxy.rootHandler),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
-	ts := &TestServer{
-		server:  server,
-		ctx:     ctx,
-		cancel:  cancel,
-		started: make(chan bool, 1),
-	}
-
-	go ts.start()
-
-	select {
-	case <-ts.started:
-		return ts, nil
-	case <-time.After(5 * time.Second):
-		ts.cancel()
-		return nil, fmt.Errorf("server failed to start within timeout")
-	}
-}
-
-func (ts *TestServer) start() {
-	// Note: This function is no longer used with the simplified approach
-
-	// Start the server
 	go func() {
-		if err := ts.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			// Server failed to start
-			return
-		}
+		_ = server.Serve(ln)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-
-	addr := ts.server.Addr
-	if strings.HasPrefix(addr, ":") {
-		ts.port = strings.TrimPrefix(addr, ":")
-		ts.baseURL = "http://localhost" + addr
-	} else {
-		parts := strings.Split(addr, ":")
-		if len(parts) == 2 {
-			ts.port = parts[1]
-			ts.baseURL = "http://localhost:" + ts.port
-		}
-	}
-
+	baseURL := "http://" + ln.Addr().String()
 	client := &http.Client{Timeout: 2 * time.Second}
-	for i := 0; i < 10; i++ {
-		resp, err := client.Get(ts.baseURL + "/health")
-		if err == nil {
-			resp.Body.Close()
-			ts.started <- true
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	// If we get here, server didn't start properly
-	ts.started <- false
-}
-
-func (ts *TestServer) Stop() {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-
-	if ts.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		ts.server.Shutdown(ctx)
-		ts.cancel()
-	}
-}
-
-func (ts *TestServer) URL() string {
-	return ts.baseURL
-}
-
-func startTestProxy(t *testing.T, allowInternal, allowDNSRebinding bool) (string, func()) {
-	proxy := NewSSRFProxy()
-	proxy.blockInternalIPs = !allowInternal
-	proxy.blockDNSRebinding = !allowDNSRebinding
-	proxy.verbose = false
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", proxy.healthHandler)
-	mux.HandleFunc("/", proxy.proxyHandler)
-
-	port := 18080
-	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: mux,
-	}
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			t.Logf("Server error: %v", err)
-		}
-	}()
-
-	baseURL := fmt.Sprintf("http://localhost:%d", port)
-	client := &http.Client{Timeout: 1 * time.Second}
-
-	for i := 0; i < 30; i++ {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
 		resp, err := client.Get(baseURL + "/health")
 		if err == nil {
 			resp.Body.Close()
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
-		if i == 29 {
-			t.Fatalf("Server failed to start within timeout")
+		if time.Now().After(deadline) {
+			server.Close()
+			t.Fatalf("Server failed to start within timeout: %v", err)
 		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	cleanup := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		server.Shutdown(ctx)
+		_ = server.Shutdown(ctx)
 	}
 
 	return baseURL, cleanup
@@ -200,9 +101,11 @@ func TestIntegrationBlockInternalIPs(t *testing.T) {
 		targetURL     string
 		expectBlocked bool
 	}{
-		{"Block localhost - strict", false, "http://127.0.0.1:8080/test", true},
-		{"Block private IP - strict", false, "http://192.168.1.1/test", true},
-		{"Allow localhost - permissive", true, "http://127.0.0.1:8080/test", false},
+		{"Block localhost strict", false, "http://127.0.0.1:9/test", true},
+		{"Block private IP strict", false, "http://192.168.1.1/test", true},
+		{"Allow localhost permissive", true, "http://127.0.0.1:9/test", false},
+		{"Block decimal loopback", false, "http://2130706433/", true},
+		{"Block unspecified", false, "http://0.0.0.0/", true},
 	}
 
 	for _, tc := range testCases {
@@ -211,7 +114,6 @@ func TestIntegrationBlockInternalIPs(t *testing.T) {
 			defer cleanup()
 
 			client := &http.Client{Timeout: 5 * time.Second}
-			// Use X-Target-URL header instead of path to avoid URL encoding issues
 			req, err := http.NewRequest("GET", baseURL+"/", nil)
 			if err != nil {
 				t.Fatalf("Failed to create request: %v", err)
@@ -228,10 +130,8 @@ func TestIntegrationBlockInternalIPs(t *testing.T) {
 					body, _ := io.ReadAll(resp.Body)
 					t.Errorf("Expected status 403 (blocked), got %d. Body: %s", resp.StatusCode, string(body))
 				}
-			} else {
-				if resp.StatusCode == http.StatusForbidden {
-					t.Errorf("Expected request to be allowed, got 403 (blocked)")
-				}
+			} else if resp.StatusCode == http.StatusForbidden {
+				t.Errorf("Expected request to be allowed, got 403 (blocked)")
 			}
 		})
 	}
@@ -242,7 +142,13 @@ func TestIntegrationUncommonMethods(t *testing.T) {
 		t.Skip("Skipping integration test in short mode")
 	}
 
-	baseURL, cleanup := startTestProxy(t, true, true) // Allow everything except methods
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	baseURL, cleanup := startTestProxy(t, true, true)
 	defer cleanup()
 
 	testCases := []struct {
@@ -265,7 +171,7 @@ func TestIntegrationUncommonMethods(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create request: %v", err)
 			}
-			req.Header.Set("X-Target-URL", "http://httpbin.org/get")
+			req.Header.Set("X-Target-URL", upstream.URL)
 
 			resp, err := client.Do(req)
 			if err != nil {
@@ -277,11 +183,9 @@ func TestIntegrationUncommonMethods(t *testing.T) {
 				if resp.StatusCode != http.StatusForbidden {
 					t.Errorf("Method %s should be blocked (403), got %d", tc.method, resp.StatusCode)
 				}
-			} else {
-				if resp.StatusCode == http.StatusForbidden {
-					body, _ := io.ReadAll(resp.Body)
-					t.Errorf("Method %s should be allowed, got 403. Body: %s", tc.method, string(body))
-				}
+			} else if resp.StatusCode == http.StatusForbidden {
+				body, _ := io.ReadAll(resp.Body)
+				t.Errorf("Method %s should be allowed, got 403. Body: %s", tc.method, string(body))
 			}
 		})
 	}
@@ -292,47 +196,49 @@ func TestIntegrationCustomHeaders(t *testing.T) {
 		t.Skip("Skipping integration test in short mode")
 	}
 
-	baseURL, cleanup := startTestProxy(t, false, false) // Strict mode
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	baseURL, cleanup := startTestProxy(t, true, true)
 	defer cleanup()
 
-	testCases := []struct {
-		name          string
-		targetURL     string
-		expectBlocked bool
-	}{
-		{"External URL via header", "http://httpbin.org/get", false},
-		{"Internal IP via header", "http://127.0.0.1:8080/test", true},
-		{"Private IP via header", "http://192.168.1.1/test", true},
+	// External via header should work when internals are allowed for httptest hosts.
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET", baseURL+"/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Target-URL", upstream.URL)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatalf("expected allowed upstream, got 403")
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	strictURL, strictCleanup := startTestProxy(t, false, false)
+	defer strictCleanup()
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			req, err := http.NewRequest("GET", baseURL+"/", nil)
-			if err != nil {
-				t.Fatalf("Failed to create request: %v", err)
-			}
-			req.Header.Set("X-Target-URL", tc.targetURL)
-
-			resp, err := client.Do(req)
-			if err != nil {
-				t.Fatalf("Request failed: %v", err)
-			}
-			defer resp.Body.Close()
-
-			if tc.expectBlocked {
-				if resp.StatusCode != http.StatusForbidden {
-					body, _ := io.ReadAll(resp.Body)
-					t.Errorf("Expected 403 (blocked), got %d. Body: %s", resp.StatusCode, string(body))
-				}
-			} else {
-				if resp.StatusCode == http.StatusForbidden {
-					body, _ := io.ReadAll(resp.Body)
-					t.Errorf("Expected allowed, got 403. Body: %s", string(body))
-				}
-			}
-		})
+	for _, target := range []string{"http://127.0.0.1:9/test", "http://192.168.1.1/test"} {
+		req, err := http.NewRequest("GET", strictURL+"/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Target-URL", target)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 for %s, got %d body=%s", target, resp.StatusCode, body)
+		}
 	}
 }
 
@@ -347,9 +253,9 @@ func TestIntegrationDNSRebinding(t *testing.T) {
 		targetURL         string
 		expectBlocked     bool
 	}{
-		{"DNS rebinding - strict", false, "http://127.0.0.1.evil.example/test", true},
-		{"DNS rebinding - permissive", true, "http://127.0.0.1.evil.example/test", false},
-		{"Localhost subdomain - strict", false, "http://localhost.evil.example/test", true},
+		{"DNS rebinding strict", false, "http://127.0.0.1.evil.example/test", true},
+		{"DNS rebinding permissive", true, "http://127.0.0.1.evil.example/test", false},
+		{"Localhost subdomain strict", false, "http://localhost.evil.example/test", true},
 	}
 
 	for _, tc := range testCases {
@@ -374,13 +280,83 @@ func TestIntegrationDNSRebinding(t *testing.T) {
 					body, _ := io.ReadAll(resp.Body)
 					t.Errorf("Expected 403 (blocked), got %d. Body: %s", resp.StatusCode, string(body))
 				}
-			} else {
-				if resp.StatusCode == http.StatusForbidden {
-					body, _ := io.ReadAll(resp.Body)
-					t.Errorf("Expected allowed, got 403. Body: %s", string(body))
-				}
+			} else if resp.StatusCode == http.StatusForbidden {
+				body, _ := io.ReadAll(resp.Body)
+				t.Errorf("Expected allowed, got 403. Body: %s", string(body))
 			}
 		})
+	}
+}
+
+func TestIntegrationPathMode(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	baseURL, cleanup := startTestProxy(t, false, false)
+	defer cleanup()
+
+	resp, err := http.Get(baseURL + "/http://127.0.0.1/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("path mode should block internal target, got %d body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestIntegrationRedirectChain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	internalHit := false
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		internalHit = true
+		fmt.Fprint(w, "PWNED")
+	}))
+	defer internal.Close()
+
+	external := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, internal.URL, http.StatusFound)
+	}))
+	defer external.Close()
+
+	proxy := NewSSRFProxy()
+	firstHop := external.Listener.Addr().String()
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if addr == firstHop {
+					return (&net.Dialer{}).DialContext(ctx, network, addr)
+				}
+				return proxy.safeDialContext(ctx, network, addr)
+			},
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			req.Header.Del("X-Target-URL")
+			detections := proxy.validateRedirect(req)
+			if len(detections) > 0 {
+				return &ssrfBlockError{detections: detections, reason: "SSRF detected in redirect"}
+			}
+			return nil
+		},
+	}
+
+	resp, err := client.Get(external.URL)
+	if resp != nil {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	if internalHit {
+		t.Fatal("redirect to internal server was followed")
+	}
+	if err == nil {
+		t.Fatal("expected SSRF block error on redirect")
 	}
 }
 
@@ -389,56 +365,29 @@ func TestIntegrationExternalService(t *testing.T) {
 		t.Skip("Skipping integration test in short mode")
 	}
 
-	baseURL, cleanup := startTestProxy(t, false, false)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	baseURL, cleanup := startTestProxy(t, true, true)
 	defer cleanup()
 
-	// Test with httpbin.org if available
 	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest("GET", baseURL+"/", nil)
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}
-	req.Header.Set("X-Target-URL", "http://httpbin.org/status/200")
+	req.Header.Set("X-Target-URL", upstream.URL)
 	resp, err := client.Do(req)
 	if err != nil {
-		t.Skipf("Skipping external service test due to connectivity: %v", err)
-		return
+		t.Fatalf("request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
-	// Should not be blocked
 	if resp.StatusCode == http.StatusForbidden {
 		body, _ := io.ReadAll(resp.Body)
 		t.Errorf("External service was blocked: %s", string(body))
 	}
-
-	t.Logf("External service test completed with status: %d", resp.StatusCode)
-}
-
-// Benchmark integration test
-func BenchmarkIntegrationProxy(b *testing.B) {
-	server, err := NewTestServer(false, false)
-	if err != nil {
-		b.Fatalf("Failed to start test server: %v", err)
-	}
-	defer server.Stop()
-
-	client := &http.Client{Timeout: 5 * time.Second}
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			// Test blocking internal IP (should be fast)
-			resp, err := client.Get(server.URL() + "/http://127.0.0.1:8080/test")
-			if err != nil {
-				b.Error(err)
-				continue
-			}
-			resp.Body.Close()
-
-			if resp.StatusCode != http.StatusForbidden {
-				b.Errorf("Expected 403, got %d", resp.StatusCode)
-			}
-		}
-	})
 }
