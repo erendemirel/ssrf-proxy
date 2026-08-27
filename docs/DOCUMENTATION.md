@@ -40,17 +40,24 @@
 ### 1. Internal IP Address Detection
 
 The proxy detects and blocks requests to:
-- **Private IPv4 ranges**: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-- **Loopback addresses**: 127.0.0.0/8, ::1/128
-- **Link-local addresses**: 169.254.0.0/16, fe80::/10
-- **Unique local IPv6**: fc00::/7
+- Private IPv4 ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+- Loopback addresses: 127.0.0.0/8, ::1/128
+- Link local addresses: 169.254.0.0/16, fe80::/10
+- Unique local IPv6: fc00::/7
+- Unspecified addresses: 0.0.0.0, ::
+- Broadcast: 255.255.255.255
+- Decimal IPv4 forms such as `2130706433` (127.0.0.1)
+
+IP checks run when the request is validated and again at dial time so DNS answers cannot silently change to an internal address after the first lookup.
 
 **Example blocked requests**:
 ```bash
-curl http://localhost:8080/http://192.168.1.1      # Blocked
-curl http://localhost:8080/http://10.0.0.1         # Blocked  
-curl http://localhost:8080/http://127.0.0.1        # Blocked
-curl http://localhost:8080/http://localhost        # Blocked
+curl http://localhost:8080/http://192.168.1.1
+curl http://localhost:8080/http://10.0.0.1
+curl http://localhost:8080/http://127.0.0.1
+curl http://localhost:8080/http://localhost
+curl -H "X-Target-URL: http://2130706433/" http://localhost:8080/
+curl -H "X-Target-URL: http://0.0.0.0/" http://localhost:8080/
 ```
 
 ### 2. DNS Rebinding Attack Detection
@@ -60,11 +67,12 @@ Detects suspicious DNS patterns that could indicate DNS rebinding:
 - localhost subdomains (`localhost.evil.com`)
 - Domains ending with internal IPs (`evil.com.127.0.0.1`)
 - Hosts resolving to both internal and external IPs
+- Dial time resolution that lands on an internal address
 
 **Example blocked requests**:
 ```bash
-curl http://localhost:8080/http://192.168.1.1.evil.com    # Blocked
-curl http://localhost:8080/http://localhost.attacker.com  # Blocked
+curl http://localhost:8080/http://192.168.1.1.evil.com
+curl http://localhost:8080/http://localhost.attacker.com
 ```
 
 ### 3. Uncommon HTTP Method Detection
@@ -74,9 +82,36 @@ By default, only these methods are allowed:
 
 **Example blocked requests**:
 ```bash
-curl -X TRACE http://localhost:8080/http://example.com     # Blocked
-curl -X CONNECT http://localhost:8080/http://example.com   # Blocked
-curl -X OPTIONS http://localhost:8080/http://example.com   # Blocked
+curl -X TRACE -H "X-Target-URL: http://example.com" http://localhost:8080/
+curl -X CONNECT -H "X-Target-URL: http://example.com" http://localhost:8080/
+curl -X OPTIONS -H "X-Target-URL: http://example.com" http://localhost:8080/
+```
+
+### 4. Redirect Chain Detection
+
+Each redirect hop is validated against the same SSRF rules. The `X-Target-URL` header is stripped from outbound requests so it cannot poison redirect checks.
+
+```bash
+# A public URL that redirects to http://127.0.0.1/ is blocked with HTTP 403
+curl -H "X-Target-URL: https://example.com/redirect-to-internal" http://localhost:8080/
+```
+
+
+## Request Modes
+
+### Path mode
+```bash
+curl http://localhost:8080/http://example.com
+```
+
+### Query parameter mode
+```bash
+curl "http://localhost:8080/?url=http://example.com"
+```
+
+### Header mode
+```bash
+curl -H "X-Target-URL: http://example.com" http://localhost:8080/
 ```
 
 
@@ -184,6 +219,7 @@ curl http://localhost:8080/health
 - Deploy the proxy within your trusted network perimeter
 - Use HTTPS for production deployments
 - Implement proper authentication for management endpoints
+- Prefer application level allowlists for sensitive destinations
 
 ### 2. Rate Limiting
 Consider implementing rate limiting for production use:
@@ -195,7 +231,13 @@ iptables -A INPUT -p tcp --dport 8080 -m limit --limit 25/minute --limit-burst 1
 ### 3. Monitoring and Alerting
 - Monitor logs for repeated SSRF attempts
 - Set up alerts for high volumes of blocked requests
-- Track successful vs. blocked request ratios
+- Track successful vs blocked request ratios
+
+### 4. Known Limits
+- This is a basic outbound request guard, not a substitute for secure application design
+- Dial time checks reduce DNS rebinding risk; they do not replace destination allowlists
+- Self signed upstream certificates are rejected by default
+
 
 ## Troubleshooting
 
@@ -223,7 +265,7 @@ TLS handshake failed
 ```
 - The proxy validates TLS certificates by default
 - For development, target services must have valid certificates
-- Self-signed certificates will be rejected
+- Self signed certificates will be rejected
 
 ### Debug Mode
 
